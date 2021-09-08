@@ -5,6 +5,7 @@ use blobstore_interface::{
     BlobList, Blobstore, BlobstoreReceiver, BlobstoreResult, Container, FileBlob, FileChunk,
     GetObjectInfoRequest, RemoveObjectRequest, StartDownloadRequest,
 };
+use futures::TryStreamExt;
 use hyper::{Client, Uri};
 use hyper_proxy::{Intercept, Proxy, ProxyConnector};
 use hyper_tls::HttpsConnector;
@@ -13,8 +14,9 @@ use log::{debug, error, info, trace, warn};
 use rusoto_core::credential::{DefaultCredentialsProvider, StaticProvider};
 use rusoto_core::Region;
 use rusoto_s3::{
-    CreateBucketRequest, DeleteBucketRequest, DeleteObjectRequest, ListObjectsV2Output,
-    ListObjectsV2Request, Object, PutObjectRequest, S3Client, S3,
+    CreateBucketRequest, DeleteBucketRequest, DeleteObjectRequest, GetObjectRequest,
+    HeadObjectOutput, HeadObjectRequest, ListObjectsV2Output, ListObjectsV2Request, Object,
+    PutObjectRequest, S3Client, S3,
 };
 use std::{
     collections::HashMap,
@@ -290,9 +292,51 @@ impl Blobstore for BlobstoreS3ProviderProvider {
     /// start_download(blob_id: string, container_id: string, chunk_size: u64, context: string?): BlobstoreResult
     async fn start_download(
         &self,
-        _ctx: &Context,
-        _arg: &StartDownloadRequest,
+        ctx: &Context,
+        arg: &StartDownloadRequest,
     ) -> RpcResult<BlobstoreResult> {
+        let actor_id = ctx
+            .actor
+            .as_ref()
+            .ok_or_else(|| RpcError::InvalidParameter("no actor in request".to_string()))?
+            .clone();
+        let s3_client = self.clients.read().unwrap()[&actor_id.to_string()].clone();
+        let container_id = arg.container_id.clone();
+        let chunk_size = arg.chunk_size;
+        let blob_id = arg.blob_id.clone();
+
+        let byte_size = {
+            let rt = tokio::runtime::Runtime::new().unwrap();
+            let info = rt
+                .block_on(head_object(
+                    &s3_client,
+                    container_id.clone(),
+                    blob_id.clone(),
+                ))
+                .unwrap();
+            info.content_length.unwrap() as u64
+        };
+
+        std::thread::spawn(move || {
+            let actor_id = actor_id.to_string();
+
+            let chunk_count = expected_chunks(byte_size, chunk_size);
+            let rt = tokio::runtime::Runtime::new().unwrap();
+            rt.block_on(async {
+                for idx in 0..chunk_count {
+                    dispatch_chunk(
+                        idx,
+                        s3_client.clone(),
+                        container_id.to_string(),
+                        blob_id.to_string(),
+                        chunk_size,
+                        byte_size,
+                        actor_id.clone(),
+                    )
+                    .await;
+                }
+            });
+        });
         Ok(build_empty_blobstore_result())
     }
 
@@ -309,6 +353,70 @@ impl Blobstore for BlobstoreS3ProviderProvider {
     ) -> RpcResult<FileBlob> {
         Ok(build_empty_fileblob())
     }
+}
+
+async fn dispatch_chunk(
+    idx: u64,
+    client: S3Client,
+    container: String,
+    id: String,
+    chunk_size: u64,
+    byte_size: u64,
+    _actor_id: String,
+) {
+    let start = idx * chunk_size;
+    let mut end = start + chunk_size - 1;
+    if end > byte_size {
+        end = byte_size - 1;
+    }
+
+    let bytes = get_blob_range(&client, &container, &id, start, end)
+        .await
+        .unwrap();
+
+    let _fc = FileChunk {
+        chunk_bytes: bytes,
+        chunk_size: chunk_size,
+        container: Container {
+            id: container.clone(),
+        },
+        context: None,
+        id: id.clone(),
+        sequence_no: idx + 1,
+        total_bytes: byte_size,
+    };
+}
+
+async fn get_blob_range(
+    client: &S3Client,
+    container_id: &str,
+    blob_id: &str,
+    start: u64,
+    end: u64,
+) -> Result<Vec<u8>, Box<dyn std::error::Error + Sync + Send>> {
+    let get_req = GetObjectRequest {
+        bucket: container_id.to_owned(),
+        key: blob_id.to_owned(),
+        range: Some(format!("bytes={}-{}", start, end)),
+        ..Default::default()
+    };
+
+    let result = client.get_object(get_req).await?;
+    let stream = result.body.unwrap();
+    let body = stream
+        .map_ok(|b| bytes::BytesMut::from(&b[..]))
+        .try_concat()
+        .await
+        .unwrap();
+    Ok(body.to_vec())
+}
+
+fn expected_chunks(total_bytes: u64, chunk_size: u64) -> u64 {
+    let mut chunks = total_bytes / chunk_size;
+    if total_bytes % chunk_size != 0 {
+        chunks = chunks + 1
+    }
+    chunks
 }
 
 async fn create_bucket(container_id: String, client: &S3Client) -> RpcResult<Container> {
@@ -386,6 +494,20 @@ async fn list_objects(
     };
     let res: ListObjectsV2Output = client.list_objects_v2(list_obj_req).await?;
     Ok(res.contents)
+}
+
+async fn head_object(
+    client: &S3Client,
+    container_id: String,
+    key: String,
+) -> Result<HeadObjectOutput, Box<dyn std::error::Error + Sync + Send>> {
+    let head_req = HeadObjectRequest {
+        bucket: container_id.to_owned(),
+        key: key.to_owned(),
+        ..Default::default()
+    };
+
+    client.head_object(head_req).await.map_err(|e| e.into())
 }
 
 fn upload_key(container_id: &str, blob_id: &str, actor_id: &str) -> String {
