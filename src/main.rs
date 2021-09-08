@@ -12,7 +12,10 @@ use hyper_tls::HttpsConnector;
 use log::{debug, error, info, trace, warn};
 use rusoto_core::credential::{DefaultCredentialsProvider, StaticProvider};
 use rusoto_core::Region;
-use rusoto_s3::{CreateBucketRequest, DeleteBucketRequest, S3Client, S3};
+use rusoto_s3::{
+    CreateBucketRequest, DeleteBucketRequest, ListObjectsV2Output, ListObjectsV2Request, Object,
+    S3Client, S3,
+};
 use std::{
     collections::HashMap,
     convert::Infallible,
@@ -189,11 +192,35 @@ impl Blobstore for BlobstoreS3ProviderProvider {
     /// list_objects(container_id: string): BlobList
     async fn list_objects<TS: ToString + ?Sized + std::marker::Sync>(
         &self,
-        _ctx: &Context,
+        ctx: &Context,
         arg: &TS,
     ) -> RpcResult<BlobList> {
-        let _container_id = arg.to_string();
-        Ok(BlobList::new())
+        let container_id = arg.to_string();
+        let actor_id = ctx
+            .actor
+            .as_ref()
+            .ok_or_else(|| RpcError::InvalidParameter("no actor in request".to_string()))?;
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let objects = rt
+            .block_on(list_objects(
+                container_id,
+                &self.clients.read().unwrap()[actor_id],
+            ))
+            .unwrap();
+        let blobs = if let Some(v) = objects {
+            v.iter()
+                .map(|ob| FileBlob {
+                    id: ob.key.clone().unwrap(),
+                    container: Container {
+                        id: arg.to_string().clone(),
+                    },
+                    byte_size: ob.size.unwrap() as u64,
+                })
+                .collect()
+        } else {
+            BlobList::new()
+        };
+        Ok(blobs)
     }
 
     /// upload_chunk(chunk: FileChunk): BlobstoreResult
@@ -251,6 +278,18 @@ async fn remove_bucket(
 
     client.delete_bucket(delete_bucket_req).await?;
     Ok(())
+}
+
+async fn list_objects(
+    container_id: String,
+    client: &S3Client,
+) -> Result<Option<Vec<Object>>, Box<dyn std::error::Error + Sync + Send>> {
+    let list_obj_req = ListObjectsV2Request {
+        bucket: container_id.to_owned(),
+        ..Default::default()
+    };
+    let res: ListObjectsV2Output = client.list_objects_v2(list_obj_req).await?;
+    Ok(res.contents)
 }
 
 fn build_empty_fileblob() -> FileBlob {
