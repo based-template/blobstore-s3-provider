@@ -5,9 +5,23 @@ use blobstore_interface::{
     BlobList, Blobstore, BlobstoreReceiver, BlobstoreResult, Container, FileBlob, FileChunk,
     GetObjectInfoRequest, RemoveObjectRequest, StartDownloadRequest,
 };
+use hyper::{Client, Uri};
+use hyper_proxy::{Intercept, Proxy, ProxyConnector};
+use hyper_tls::HttpsConnector;
 #[allow(unused_imports)]
 use log::{debug, error, info, trace, warn};
+use rusoto_core::credential::{DefaultCredentialsProvider, StaticProvider};
+use rusoto_core::Region;
+use rusoto_s3::{CreateBucketRequest, DeleteBucketRequest, S3Client, S3};
+use std::{
+    collections::HashMap,
+    convert::Infallible,
+    sync::{Arc, RwLock},
+};
 use wasmbus_rpc::provider::prelude::*;
+
+type HttpConnector =
+    hyper_proxy::ProxyConnector<hyper_tls::HttpsConnector<hyper::client::HttpConnector>>;
 //use wasmcloud_interface_factorial::{Factorial, FactorialReceiver};
 
 // main (via provider_main) initializes the threaded tokio executor,
@@ -23,12 +37,80 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 /// blobstore-s3-provider capability provider implementation
 #[derive(Default, Clone)]
-struct BlobstoreS3ProviderProvider {}
+struct BlobstoreS3ProviderProvider {
+    clients: Arc<RwLock<HashMap<String, S3Client>>>,
+}
+
+fn client_for_config(config_map: &HashMap<String, String>) -> RpcResult<S3Client> {
+    let region = if config_map.contains_key("REGION") {
+        Region::Custom {
+            name: config_map["REGION"].clone(),
+            endpoint: if config_map.contains_key("ENDPOINT") {
+                config_map["ENDPOINT"].clone()
+            } else {
+                "s3.us-east-1.amazonaws.com".to_string()
+            },
+        }
+    } else {
+        Region::UsEast1
+    };
+
+    let client = if config_map.contains_key("AWS_ACCESS_KEY") {
+        let provider = StaticProvider::new(
+            config_map["AWS_ACCESS_KEY"].to_string(),
+            config_map["AWS_SECRET_ACCESS_KEY"].to_string(),
+            config_map.get("AWS_TOKEN").cloned(),
+            config_map
+                .get("TOKEN_VALID_FOR")
+                .map(|t| t.parse::<i64>().unwrap()),
+        );
+        let connector: HttpConnector = if let Some(proxy) = config_map.get("HTTP_PROXY") {
+            let proxy = Proxy::new(Intercept::All, proxy.parse::<Uri>().unwrap());
+            ProxyConnector::from_proxy(hyper_tls::HttpsConnector::new(), proxy).unwrap()
+        } else {
+            ProxyConnector::new(HttpsConnector::new()).unwrap()
+        };
+        let mut hyper_builder: hyper::client::Builder = Client::builder();
+        hyper_builder.pool_max_idle_per_host(0);
+        let client = rusoto_core::HttpClient::from_builder(hyper_builder, connector);
+        S3Client::new_with(client, provider, region)
+    } else {
+        let provider = DefaultCredentialsProvider::new().unwrap();
+        S3Client::new_with(
+            rusoto_core::request::HttpClient::new()
+                .expect("Failed to create HTTP client for S3 provider"),
+            provider,
+            region,
+        )
+    };
+
+    Ok(client)
+}
 
 /// use default implementations of provider message handlers
 impl ProviderDispatch for BlobstoreS3ProviderProvider {}
 impl BlobstoreReceiver for BlobstoreS3ProviderProvider {}
-impl ProviderHandler for BlobstoreS3ProviderProvider {}
+#[async_trait]
+impl ProviderHandler for BlobstoreS3ProviderProvider {
+    async fn put_link(&self, ld: &LinkDefinition) -> RpcResult<bool> {
+        // self.clients.write().unwrap().insert(config.module.clone(), Arc::new(s3::client_for_config(&config)?),);
+        // TODO: write client_for_config!!!
+        self.clients
+            .write()
+            .unwrap()
+            .insert(ld.actor_id.to_string(), client_for_config(&ld.values)?);
+        Ok(true)
+    }
+
+    async fn delete_link(&self, actor_id: &str) {
+        // self.clients.write().unwrap().remove(_actor_id)
+        self.clients.write().unwrap().remove(actor_id);
+    }
+
+    async fn shutdown(&self) -> Result<(), Infallible> {
+        Ok(())
+    }
+}
 
 /// Handle Blobstore methods
 #[async_trait]
@@ -36,21 +118,63 @@ impl Blobstore for BlobstoreS3ProviderProvider {
     /// creates a new container
     async fn create_container<TS: ToString + ?Sized + std::marker::Sync>(
         &self,
-        _ctx: &Context,
+        ctx: &Context,
         arg: &TS,
     ) -> RpcResult<Container> {
-        let _container_id = arg.to_string();
-        Ok(build_empty_container())
+        let container_id = arg.to_string();
+        let actor_id = ctx
+            .actor
+            .as_ref()
+            .ok_or_else(|| RpcError::InvalidParameter("no actor in request".to_string()))?;
+        //let s3_client = &self.clients.read().unwrap()[actor_id];
+        let rd = self.clients.read().unwrap();
+        //.ok_or_else(|| RpcError::InvalidParameter("no actor in request".to_string()))?;
+        let s3_client = rd
+            .get(actor_id)
+            .ok_or_else(|| RpcError::InvalidParameter(format!("actor not linked:{}", actor_id)))?;
+        /*
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(s3_client.create_bucket(create_bucket_req))
+            .map_err(|_e| RpcError::Other("create_bucket() failed".to_string()))?;
+         */
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(create_bucket(container_id.clone(), s3_client))?;
+        Ok(Container {
+            id: container_id.clone(),
+        })
+        //let rt = tokio::runtime::Runtime::new().unwrap();
+        //rt.block_on()
+        //Ok(build_empty_container())
     }
 
     /// RemoveContainer(id: string): BlobstoreResult
     async fn remove_container<TS: ToString + ?Sized + std::marker::Sync>(
         &self,
-        _ctx: &Context,
+        ctx: &Context,
         arg: &TS,
     ) -> RpcResult<BlobstoreResult> {
-        let _container_id = arg.to_string();
-        Ok(build_empty_blobstore_result())
+        let actor_id = ctx
+            .actor
+            .as_ref()
+            .ok_or_else(|| RpcError::InvalidParameter("no actor in request".to_string()))?;
+        let bucket_id = arg.to_string();
+        let rd = self.clients.read().unwrap();
+        let s3_client = rd
+            .get(actor_id)
+            .ok_or_else(|| RpcError::InvalidParameter(format!("actor not linked:{}", actor_id)))?;
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        Ok(rt
+            .block_on(remove_bucket(bucket_id, s3_client))
+            .map_or_else(
+                |e| BlobstoreResult {
+                    success: false,
+                    error: Some(e.to_string()),
+                },
+                |_| BlobstoreResult {
+                    success: true,
+                    error: None,
+                },
+            ))
     }
 
     /// remove_object()
@@ -99,12 +223,34 @@ impl Blobstore for BlobstoreS3ProviderProvider {
     ) -> RpcResult<FileBlob> {
         Ok(build_empty_fileblob())
     }
-    /*
-    /// accepts a number and calculates its factorial
-    async fn calculate(&self, _ctx: &Context, req: &u32) -> RpcResult<u64> {
-        Ok(n_factorial(*req))
-    }
-    */
+}
+
+async fn create_bucket(container_id: String, client: &S3Client) -> RpcResult<Container> {
+    let create_bucket_req = CreateBucketRequest {
+        bucket: container_id.to_string(),
+        ..Default::default()
+    };
+    client
+        .create_bucket(create_bucket_req)
+        .await
+        .map_err(|_e| RpcError::Other("create_bucket() failed".to_string()))
+        .unwrap();
+    Ok(Container {
+        id: container_id.clone(),
+    })
+}
+
+async fn remove_bucket(
+    container_id: String,
+    client: &S3Client,
+) -> Result<(), Box<dyn std::error::Error + Sync + Send>> {
+    let delete_bucket_req = DeleteBucketRequest {
+        bucket: container_id.to_owned(),
+        ..Default::default()
+    };
+
+    client.delete_bucket(delete_bucket_req).await?;
+    Ok(())
 }
 
 fn build_empty_fileblob() -> FileBlob {
@@ -128,6 +274,7 @@ fn build_empty_blobstore_result() -> BlobstoreResult {
     };
 }
 
+/*
 /// calculate n factorial
 fn n_factorial(n: u32) -> u64 {
     match n {
@@ -143,6 +290,7 @@ fn n_factorial(n: u32) -> u64 {
         }
     }
 }
+*/
 
 /// Handle incoming rpc messages and dispatch to applicable trait handler.
 #[async_trait]
