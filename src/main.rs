@@ -13,8 +13,8 @@ use log::{debug, error, info, trace, warn};
 use rusoto_core::credential::{DefaultCredentialsProvider, StaticProvider};
 use rusoto_core::Region;
 use rusoto_s3::{
-    CreateBucketRequest, DeleteBucketRequest, ListObjectsV2Output, ListObjectsV2Request, Object,
-    S3Client, S3,
+    CreateBucketRequest, DeleteBucketRequest, DeleteObjectRequest, ListObjectsV2Output,
+    ListObjectsV2Request, Object, PutObjectRequest, S3Client, S3,
 };
 use std::{
     collections::HashMap,
@@ -38,10 +38,26 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+#[derive(Debug, PartialEq)]
+struct FileUpload {
+    container: String,
+    id: String,
+    total_bytes: u64,
+    expected_chunks: u64,
+    chunks: Vec<FileChunk>,
+}
+
+impl FileUpload {
+    fn is_complete(&self) -> bool {
+        self.chunks.len() == self.expected_chunks as usize
+    }
+}
+
 /// blobstore-s3-provider capability provider implementation
 #[derive(Default, Clone)]
 struct BlobstoreS3ProviderProvider {
     clients: Arc<RwLock<HashMap<String, S3Client>>>,
+    uploads: Arc<RwLock<HashMap<String, FileUpload>>>,
 }
 
 fn client_for_config(config_map: &HashMap<String, String>) -> RpcResult<S3Client> {
@@ -183,10 +199,30 @@ impl Blobstore for BlobstoreS3ProviderProvider {
     /// remove_object()
     async fn remove_object(
         &self,
-        _ctx: &Context,
-        _arg: &RemoveObjectRequest,
+        ctx: &Context,
+        arg: &RemoveObjectRequest,
     ) -> RpcResult<BlobstoreResult> {
-        Ok(build_empty_blobstore_result())
+        let actor_id = ctx
+            .actor
+            .as_ref()
+            .ok_or_else(|| RpcError::InvalidParameter("no actor in request".to_string()))?;
+        let container_id = arg.container_id.to_string();
+        let object_id = arg.id.to_string();
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(remove_object(
+            container_id,
+            object_id,
+            &self.clients.read().unwrap()[actor_id],
+        ))
+        .map_or_else(
+            |e| Err(RpcError::from(format!("remove_object(): {}", e))),
+            |_| {
+                Ok(BlobstoreResult {
+                    success: true,
+                    error: None,
+                })
+            },
+        )
     }
 
     /// list_objects(container_id: string): BlobList
@@ -224,7 +260,30 @@ impl Blobstore for BlobstoreS3ProviderProvider {
     }
 
     /// upload_chunk(chunk: FileChunk): BlobstoreResult
-    async fn upload_chunk(&self, _ctx: &Context, _arg: &FileChunk) -> RpcResult<BlobstoreResult> {
+    async fn upload_chunk(&self, ctx: &Context, arg: &FileChunk) -> RpcResult<BlobstoreResult> {
+        let actor_id = ctx
+            .actor
+            .as_ref()
+            .ok_or_else(|| RpcError::InvalidParameter("no actor in request".to_string()))?;
+        let key = upload_key(&arg.container.id, &arg.id, actor_id);
+        self.uploads
+            .write()
+            .unwrap()
+            .entry(key.clone())
+            .and_modify(|u| {
+                u.chunks.push(arg.clone());
+            });
+        if self.uploads.read().unwrap()[&key].is_complete() {
+            let rt = tokio::runtime::Runtime::new().unwrap();
+            let upload_res = rt
+                .block_on(complete_upload(
+                    &self.clients.read().unwrap()[actor_id],
+                    &self.uploads.read().unwrap()[&key],
+                ))
+                .map_err(|e| RpcError::from(format!("complete_upload(): {}", e)));
+            self.uploads.write().unwrap().remove(&key);
+            return upload_res;
+        }
         Ok(build_empty_blobstore_result())
     }
 
@@ -280,6 +339,43 @@ async fn remove_bucket(
     Ok(())
 }
 
+async fn complete_upload(
+    client: &S3Client,
+    upload: &FileUpload,
+) -> Result<BlobstoreResult, Box<dyn std::error::Error + Sync + Send>> {
+    let bytes = upload
+        .chunks
+        .iter()
+        .fold(vec![], |a, c| [&a[..], &c.chunk_bytes[..]].concat());
+    let put_request = PutObjectRequest {
+        bucket: upload.container.to_string(),
+        key: upload.id.to_string(),
+        body: Some(bytes.into()),
+        ..Default::default()
+    };
+
+    client.put_object(put_request).await?;
+    Ok(BlobstoreResult {
+        error: None,
+        success: true,
+    })
+}
+
+async fn remove_object(
+    container_id: String,
+    object_id: String,
+    client: &S3Client,
+) -> Result<(), Box<dyn std::error::Error + Sync + Send>> {
+    let delete_object_req = DeleteObjectRequest {
+        bucket: container_id.to_string(),
+        key: object_id.to_string(),
+        ..Default::default()
+    };
+
+    client.delete_object(delete_object_req).await?;
+    Ok(())
+}
+
 async fn list_objects(
     container_id: String,
     client: &S3Client,
@@ -290,6 +386,10 @@ async fn list_objects(
     };
     let res: ListObjectsV2Output = client.list_objects_v2(list_obj_req).await?;
     Ok(res.contents)
+}
+
+fn upload_key(container_id: &str, blob_id: &str, actor_id: &str) -> String {
+    format!("{}-{}-{}", actor_id, container_id, blob_id)
 }
 
 fn build_empty_fileblob() -> FileBlob {
@@ -309,7 +409,7 @@ fn build_empty_container() -> Container {
 fn build_empty_blobstore_result() -> BlobstoreResult {
     return BlobstoreResult {
         error: None,
-        success: true,
+        success: false,
     };
 }
 
